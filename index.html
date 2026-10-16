@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bentley's Books</title>
+<style>
+  :root { --bg: #faf7f0; --fg: #222; }
+  body.dark { --bg: #161616; --fg: #ddd; }
+
+  body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: Georgia, serif;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 10px;
+    border-bottom: 1px solid #8886;
+  }
+  select, button {
+    font-size: 1rem;
+    padding: 6px 10px;
+    max-width: 100%;
+  }
+  #viewer {
+    flex: 1;
+    min-height: 0;
+  }
+  footer {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px;
+    border-top: 1px solid #8886;
+  }
+  footer button { flex: 0 0 45%; }
+</style>
+</head>
+<body>
+
+<header>
+  <select id="picker" aria-label="Choose a book">
+    <!-- EDIT THIS LIST: value = file path, text = title people see -->
+    <option value="books/book-one.epub">Book One</option>
+    <option value="books/book-two.epub">Book Two</option>
+  </select>
+  <select id="toc" aria-label="Chapters"></select>
+  <button id="smaller" aria-label="Smaller text">A-</button>
+  <button id="bigger" aria-label="Bigger text">A+</button>
+  <button id="theme">Dark mode</button>
+</header>
+
+<div id="viewer"></div>
+
+<footer>
+  <button id="prev">&larr; Prev</button>
+  <button id="next">Next &rarr;</button>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.88/epub.min.js"></script>
+
+<script>
+  let book, rendition, currentPath;
+  let fontSize = 100;   // zoom percentage; every text size is multiplied by this
+  let dark = false;
+
+  const picker = document.getElementById("picker");
+  const tocSelect = document.getElementById("toc");
+
+  // Safe wrappers: localStorage can fail in some browsers/private windows
+  function save(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+  function load(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+
+  function applyTheme() {
+    document.body.classList.toggle("dark", dark);
+    document.getElementById("theme").textContent = dark ? "Light mode" : "Dark mode";
+    if (rendition) {
+      rendition.themes.override("color", dark ? "#ddd" : "#222");
+      rendition.themes.override("background", dark ? "#161616" : "#faf7f0");
+    }
+  }
+
+  // Scales every element's text by the zoom level, using its ORIGINAL size,
+  // so a heading that is 2x the body text stays 2x at any zoom.
+  function scaleText(contents) {
+    const doc = contents.document;
+    const win = contents.window;
+    const els = [doc.body, ...doc.body.querySelectorAll("*")];
+
+    // Pass 1: remember each element's original size (only the first time)
+    els.forEach((el) => {
+      if (!el.dataset.base) {
+        el.dataset.base = parseFloat(win.getComputedStyle(el).fontSize);
+      }
+    });
+
+    // Pass 2: apply original size x zoom
+    els.forEach((el) => {
+      const size = parseFloat(el.dataset.base) * fontSize / 100;
+      el.style.setProperty("font-size", size + "px", "important");
+    });
+  }
+
+  // Re-scale the chapter on screen and stay on the same spot
+  function resizeText() {
+    if (!rendition) return;
+    let cfi = null;
+    try { cfi = rendition.currentLocation().start.cfi; } catch (e) {}
+    rendition.getContents().forEach(scaleText);
+    if (cfi) rendition.display(cfi);
+  }
+
+  // Google Fonts used as backups when a reader's device lacks the original font
+  const FONT_CSS = "https://fonts.googleapis.com/css2?family=Tinos:ital,wght@0,400;0,700;1,400;1,700&family=Great+Vibes&family=Noto+Sans+Mono:wght@400;700&display=swap";
+
+  // Key = original font name (lowercase, no spaces or dashes); value = backup font
+  const FALLBACKS = {
+    timesnewroman: "Tinos",
+    snellroundhand: "Great Vibes",
+    menlo: "Noto Sans Mono"
+  };
+
+  function addFonts(contents) {
+    const doc = contents.document;
+
+    // Load the Google fonts into the book's frame
+    const link = doc.createElement("link");
+    link.rel = "stylesheet";
+    link.href = FONT_CSS;
+    doc.head.appendChild(link);
+
+    // Add a backup font after the original one
+    const els = [doc.body, ...doc.body.querySelectorAll("*")];
+    els.forEach((el) => {
+      const stack = contents.window.getComputedStyle(el).fontFamily;
+      const flat = stack.toLowerCase().replace(/[\s"'-]/g, "");
+      for (const key in FALLBACKS) {
+        if (flat.includes(key)) {
+          el.style.setProperty("font-family", stack + ", " + FALLBACKS[key], "important");
+        }
+      }
+    });
+  }
+
+  function openBook(path) {
+    if (rendition) rendition.destroy();
+    currentPath = path;
+    book = ePub(path);
+    rendition = book.renderTo("viewer", { width: "100%", height: "100%" });
+
+    // Scale text in every chapter as it loads
+    rendition.hooks.content.register(scaleText);
+    rendition.hooks.content.register(addFonts);
+
+    // Resume where the reader left off (if they've read this book before)
+    rendition.display(load("pos:" + path) || undefined);
+
+    applyTheme();
+
+    // Remember the position every time the page changes
+    rendition.on("relocated", (location) => {
+      save("pos:" + currentPath, location.start.cfi);
+    });
+
+    // Build the chapter menu
+    book.loaded.navigation.then((nav) => {
+      tocSelect.innerHTML = "";
+      const first = document.createElement("option");
+      first.textContent = "Chapters...";
+      first.value = "";
+      tocSelect.appendChild(first);
+      nav.toc.forEach((chapter) => {
+        const opt = document.createElement("option");
+        opt.value = chapter.href;
+        opt.textContent = chapter.label.trim();
+        tocSelect.appendChild(opt);
+      });
+    });
+  }
+
+  // Controls
+  picker.addEventListener("change", () => {
+    save("lastBook", picker.value);
+    openBook(picker.value);
+  });
+
+  tocSelect.addEventListener("change", () => {
+    if (tocSelect.value) rendition.display(tocSelect.value);
+  });
+
+  document.getElementById("next").onclick = () => rendition.next();
+  document.getElementById("prev").onclick = () => rendition.prev();
+
+  document.getElementById("bigger").onclick = () => {
+    fontSize = Math.min(fontSize + 10, 200);
+    save("fontSize", fontSize);
+    resizeText();
+  };
+  document.getElementById("smaller").onclick = () => {
+    fontSize = Math.max(fontSize - 10, 70);
+    save("fontSize", fontSize);
+    resizeText();
+  };
+
+  document.getElementById("theme").onclick = () => {
+    dark = !dark;
+    applyTheme();
+    save("dark", dark ? "1" : "0");
+  };
+
+  // Arrow keys turn pages
+  document.addEventListener("keydown", (e) => {
+    if (!rendition) return;
+    if (e.key === "ArrowRight") rendition.next();
+    if (e.key === "ArrowLeft") rendition.prev();
+  });
+
+  // Startup: restore settings, then open the last book (or the first one)
+  fontSize = parseInt(load("fontSize"), 10) || 100;
+  dark = load("dark") === "1";
+  const lastBook = load("lastBook");
+  if (lastBook && [...picker.options].some((o) => o.value === lastBook)) {
+    picker.value = lastBook;
+  }
+  openBook(picker.value);
+</script>
+
+</body>
+</html>
